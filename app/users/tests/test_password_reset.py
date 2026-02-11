@@ -418,3 +418,68 @@ class TestPasswordResetTokenModel:
         reset_token = PasswordResetToken.objects.create(user=user)
 
         assert str(reset_token) == f"Password reset token for {user.email}"
+
+
+@pytest.mark.django_db
+class TestPasswordResetConcurrency:
+    """Test cases for concurrent password reset attempts."""
+
+    def test_concurrent_token_usage_prevented(self, user):
+        """Test that the same token cannot be used concurrently."""
+        import threading
+
+        reset_token = PasswordResetToken.objects.create(user=user)
+        client = Client(schema)
+
+        mutation = """
+            mutation ConfirmPasswordReset($input: ConfirmPasswordResetInput!) {
+                confirmPasswordReset(input: $input) {
+                    success
+                    message
+                    errors
+                }
+            }
+        """
+
+        results = []
+        errors = []
+
+        def reset_password():
+            """Execute password reset mutation in a thread."""
+            try:
+                result = client.execute(
+                    mutation,
+                    variables={
+                        "input": {
+                            "token": reset_token.token,
+                            "newPassword": "NewSecurePass123!",
+                        }
+                    },
+                )
+                results.append(result)
+            except Exception as e:
+                errors.append(e)
+
+        # Create two threads that try to use the same token simultaneously
+        thread1 = threading.Thread(target=reset_password)
+        thread2 = threading.Thread(target=reset_password)
+
+        thread1.start()
+        thread2.start()
+        thread1.join()
+        thread2.join()
+
+        # Only one should succeed
+        success_count = sum(
+            1
+            for r in results
+            if r.get("data", {}).get("confirmPasswordReset", {}).get("success")
+        )
+
+        assert success_count == 1, "Only one concurrent request should succeed"
+
+        # Verify token was marked as used
+        reset_token.refresh_from_db()
+        assert not reset_token.is_valid()
+        assert reset_token.used_at is not None
+        assert reset_token.is_active is False

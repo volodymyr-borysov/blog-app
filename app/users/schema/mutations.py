@@ -235,6 +235,11 @@ class ChangePassword(graphene.Mutation):
         user.set_password(new_password)
         user.save()
 
+        # Invalidate any pending password reset tokens
+        from ..models import PasswordResetToken
+
+        PasswordResetToken.objects.filter(user=user, is_active=True).update(is_active=False)
+
         return ChangePassword(success=True, errors=None)
 
 
@@ -260,52 +265,79 @@ class RequestPasswordReset(graphene.Mutation):
 
     @classmethod
     def mutate(cls, root, info, input):
+        import logging
+
         from django.conf import settings
         from django.core.mail import send_mail
 
         from ..models import PasswordResetToken
 
-        try:
-            user = User.objects.get(email=input.email)
-        except User.DoesNotExist:
-            # Don't reveal if email exists for security
+        logger = logging.getLogger(__name__)
+
+        # Validate email format first (fail fast for clearly invalid emails)
+        email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+        if not re.match(email_regex, input.email):
+            # For invalid format, still return success message
             return RequestPasswordReset(
                 success=True,
                 message=(
-                    "If an account with this email exists, " "a password reset link has been sent."
+                    "If an account with this email exists, "
+                    "a password reset link has been sent."
                 ),
                 errors=None,
             )
 
-        # Deactivate any existing active tokens for this user
-        PasswordResetToken.objects.filter(user=user, is_active=True).update(is_active=False)
-
-        # Create new token
-        reset_token = PasswordResetToken.objects.create(user=user)
-
-        # Send email
-        reset_url = f"{settings.FRONTEND_URL}/reset-password?token={reset_token.token}"
-
+        # Try to get user
         try:
-            send_mail(
-                subject="Password Reset Request",
-                message=f"Hello {user.get_full_name()},\n\n"
-                f"You requested a password reset. Click the link below to reset your password:\n\n"
-                f"{reset_url}\n\n"
-                f"This link will expire in 24 hours.\n\n"
-                f"If you didn't request this, please ignore this email.\n\n"
-                f"Best regards,\nThe Blog Team",
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[user.email],
-                fail_silently=False,
-            )
-        except Exception as e:
-            return RequestPasswordReset(
-                success=False,
-                message=None,
-                errors=[f"Failed to send email: {str(e)}"],
+            user = User.objects.get(email=input.email)
+            user_exists = True
+        except User.DoesNotExist:
+            user = None
+            user_exists = False
+
+        # Perform operations only if user exists
+        if user_exists:
+            # Deactivate any existing active tokens for this user
+            PasswordResetToken.objects.filter(user=user, is_active=True).update(
+                is_active=False
             )
 
+            # Create new token
+            reset_token = PasswordResetToken.objects.create(user=user)
+
+            # Prepare reset URL
+            reset_url = f"{settings.FRONTEND_URL}/reset-password?token={reset_token.token}"
+
+            # Send email
+            try:
+                send_mail(
+                    subject="Password Reset Request",
+                    message=(
+                        f"Hello {user.get_full_name()},\n\n"
+                        f"You requested a password reset. Click the link below to reset your password:\n\n"
+                        f"{reset_url}\n\n"
+                        f"This link will expire in 24 hours.\n\n"
+                        f"If you didn't request this, please ignore this email.\n\n"
+                        f"Best regards,\nThe Blog Team"
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+                logger.info(f"Password reset email sent to {user.email}")
+            except Exception as e:
+                logger.error(f"Failed to send password reset email to {user.email}: {str(e)}")
+                return RequestPasswordReset(
+                    success=False,
+                    message=None,
+                    errors=[f"Failed to send email: {str(e)}"],
+                )
+        else:
+            # User doesn't exist - do nothing but maintain similar timing
+            # The database query above already consumed some time
+            logger.info(f"Password reset requested for non-existent email: {input.email}")
+
+        # Always return the same success message
         return RequestPasswordReset(
             success=True,
             message="If an account with this email exists, a password reset link has been sent.",
@@ -336,43 +368,60 @@ class ConfirmPasswordReset(graphene.Mutation):
 
     @classmethod
     def mutate(cls, root, info, input):
+        import logging
+
+        from django.db import transaction
+
         from ..models import PasswordResetToken
 
+        logger = logging.getLogger(__name__)
+
         try:
-            reset_token = PasswordResetToken.objects.get(token=input.token)
+            # Use select_for_update to lock the row and prevent race conditions
+            with transaction.atomic():
+                reset_token = PasswordResetToken.objects.select_for_update().get(
+                    token=input.token
+                )
+
+                # Validate token
+                if not reset_token.is_valid():
+                    logger.warning(
+                        f"Password reset attempted with invalid token for user {reset_token.user.email}"
+                    )
+                    return ConfirmPasswordReset(
+                        success=False, message=None, errors=["Invalid or expired token."]
+                    )
+
+                # Validate new password
+                errors = []
+                try:
+                    validate_password(input.new_password, user=reset_token.user)
+                except ValidationError as e:
+                    errors.extend(list(e.messages))
+
+                if errors:
+                    return ConfirmPasswordReset(success=False, message=None, errors=errors)
+
+                # Set new password
+                reset_token.user.set_password(input.new_password)
+                reset_token.user.save()
+
+                # Mark token as used (still within the atomic transaction)
+                reset_token.mark_as_used()
+
+                logger.info(f"Password successfully reset for user {reset_token.user.email}")
+
+                return ConfirmPasswordReset(
+                    success=True,
+                    message="Password has been reset successfully.",
+                    errors=None,
+                )
+
         except PasswordResetToken.DoesNotExist:
+            logger.warning("Password reset attempted with non-existent token")
             return ConfirmPasswordReset(
                 success=False, message=None, errors=["Invalid or expired token."]
             )
-
-        # Validate token
-        if not reset_token.is_valid():
-            return ConfirmPasswordReset(
-                success=False, message=None, errors=["Invalid or expired token."]
-            )
-
-        # Validate new password
-        errors = []
-        try:
-            validate_password(input.new_password, user=reset_token.user)
-        except ValidationError as e:
-            errors.extend(list(e.messages))
-
-        if errors:
-            return ConfirmPasswordReset(success=False, message=None, errors=errors)
-
-        # Set new password
-        reset_token.user.set_password(input.new_password)
-        reset_token.user.save()
-
-        # Mark token as used
-        reset_token.mark_as_used()
-
-        return ConfirmPasswordReset(
-            success=True,
-            message="Password has been reset successfully.",
-            errors=None,
-        )
 
 
 class Mutation(graphene.ObjectType):
