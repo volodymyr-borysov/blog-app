@@ -131,6 +131,10 @@ python manage.py seed_data --users 10 --posts 50 --comments 100
 
 # Clear and reseed
 python manage.py seed_data --clear
+
+# Clean up expired password reset tokens
+python manage.py cleanup_expired_tokens --days 30
+python manage.py cleanup_expired_tokens --dry-run
 ```
 
 ### Testing
@@ -250,6 +254,7 @@ mutation CreateComment {
 
 ### User Models
 - **User**: email, username, first_name, last_name, password, is_staff, is_active
+- **PasswordResetToken**: token, user, created_at, expires_at, used_at, is_active
 
 ## GraphQL Schema Organization
 
@@ -292,3 +297,6 @@ mutation CreateComment {
 - Seed data command helpful for development/testing
 - All test files use `test_*.py` or `*_test.py` naming convention
 - Coverage excludes migrations, tests, and management commands
+- Password reset tokens expire after 24 hours and are single-use
+- Use `cleanup_expired_tokens` command regularly to prevent database bloat
+- All security events are logged for audit purposes
