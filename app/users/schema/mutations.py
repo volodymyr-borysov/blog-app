@@ -238,6 +238,143 @@ class ChangePassword(graphene.Mutation):
         return ChangePassword(success=True, errors=None)
 
 
+class RequestPasswordResetInput(graphene.InputObjectType):
+    """Input type for requesting password reset."""
+
+    email = graphene.String(required=True, description="User email address")
+
+
+class RequestPasswordReset(graphene.Mutation):
+    """
+    Request a password reset token.
+
+    Sends an email with a password reset link to the user.
+    """
+
+    class Arguments:
+        input = RequestPasswordResetInput(required=True)
+
+    success = graphene.Boolean()
+    message = graphene.String()
+    errors = graphene.List(graphene.String)
+
+    @classmethod
+    def mutate(cls, root, info, input):
+        from django.conf import settings
+        from django.core.mail import send_mail
+
+        from ..models import PasswordResetToken
+
+        try:
+            user = User.objects.get(email=input.email)
+        except User.DoesNotExist:
+            # Don't reveal if email exists for security
+            return RequestPasswordReset(
+                success=True,
+                message=(
+                    "If an account with this email exists, " "a password reset link has been sent."
+                ),
+                errors=None,
+            )
+
+        # Deactivate any existing active tokens for this user
+        PasswordResetToken.objects.filter(user=user, is_active=True).update(is_active=False)
+
+        # Create new token
+        reset_token = PasswordResetToken.objects.create(user=user)
+
+        # Send email
+        reset_url = f"{settings.FRONTEND_URL}/reset-password?token={reset_token.token}"
+
+        try:
+            send_mail(
+                subject="Password Reset Request",
+                message=f"Hello {user.get_full_name()},\n\n"
+                f"You requested a password reset. Click the link below to reset your password:\n\n"
+                f"{reset_url}\n\n"
+                f"This link will expire in 24 hours.\n\n"
+                f"If you didn't request this, please ignore this email.\n\n"
+                f"Best regards,\nThe Blog Team",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            return RequestPasswordReset(
+                success=False,
+                message=None,
+                errors=[f"Failed to send email: {str(e)}"],
+            )
+
+        return RequestPasswordReset(
+            success=True,
+            message="If an account with this email exists, a password reset link has been sent.",
+            errors=None,
+        )
+
+
+class ConfirmPasswordResetInput(graphene.InputObjectType):
+    """Input type for confirming password reset."""
+
+    token = graphene.String(required=True, description="Password reset token")
+    new_password = graphene.String(required=True, description="New password")
+
+
+class ConfirmPasswordReset(graphene.Mutation):
+    """
+    Confirm password reset with token.
+
+    Validates the token and sets a new password for the user.
+    """
+
+    class Arguments:
+        input = ConfirmPasswordResetInput(required=True)
+
+    success = graphene.Boolean()
+    message = graphene.String()
+    errors = graphene.List(graphene.String)
+
+    @classmethod
+    def mutate(cls, root, info, input):
+        from ..models import PasswordResetToken
+
+        try:
+            reset_token = PasswordResetToken.objects.get(token=input.token)
+        except PasswordResetToken.DoesNotExist:
+            return ConfirmPasswordReset(
+                success=False, message=None, errors=["Invalid or expired token."]
+            )
+
+        # Validate token
+        if not reset_token.is_valid():
+            return ConfirmPasswordReset(
+                success=False, message=None, errors=["Invalid or expired token."]
+            )
+
+        # Validate new password
+        errors = []
+        try:
+            validate_password(input.new_password, user=reset_token.user)
+        except ValidationError as e:
+            errors.extend(list(e.messages))
+
+        if errors:
+            return ConfirmPasswordReset(success=False, message=None, errors=errors)
+
+        # Set new password
+        reset_token.user.set_password(input.new_password)
+        reset_token.user.save()
+
+        # Mark token as used
+        reset_token.mark_as_used()
+
+        return ConfirmPasswordReset(
+            success=True,
+            message="Password has been reset successfully.",
+            errors=None,
+        )
+
+
 class Mutation(graphene.ObjectType):
     """Root mutation class for user operations."""
 
@@ -253,3 +390,11 @@ class Mutation(graphene.ObjectType):
     # Profile mutations
     update_profile = UpdateProfile.Field(description="Update user profile")
     change_password = ChangePassword.Field(description="Change user password")
+
+    # Password reset mutations
+    request_password_reset = RequestPasswordReset.Field(
+        description="Request a password reset token"
+    )
+    confirm_password_reset = ConfirmPasswordReset.Field(
+        description="Confirm password reset with token"
+    )

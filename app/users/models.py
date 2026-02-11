@@ -4,8 +4,12 @@ Custom User model for the blog application.
 Extends Django's AbstractUser to add custom fields and methods.
 """
 
+import secrets
+from datetime import timedelta
+
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.utils import timezone
 
 
 class User(AbstractUser):
@@ -64,3 +68,59 @@ class User(AbstractUser):
     def get_short_name(self):
         """Return the short name for the user."""
         return self.first_name or self.username
+
+
+class PasswordResetToken(models.Model):
+    """
+    Model for storing password reset tokens.
+
+    Tokens are valid for 24 hours and can only be used once.
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="password_reset_tokens",
+        help_text="User requesting password reset",
+    )
+    token = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="Unique token for password reset",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, help_text="When the token was created")
+    expires_at = models.DateTimeField(help_text="When the token expires")
+    used_at = models.DateTimeField(null=True, blank=True, help_text="When the token was used")
+    is_active = models.BooleanField(default=True, help_text="Whether the token is still active")
+
+    class Meta:
+        db_table = "password_reset_tokens"
+        verbose_name = "Password Reset Token"
+        verbose_name_plural = "Password Reset Tokens"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["token"]),
+            models.Index(fields=["user", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"Password reset token for {self.user.email}"
+
+    def save(self, *args, **kwargs):
+        """Override save to generate token and set expiration."""
+        if not self.token:
+            self.token = secrets.token_urlsafe(48)
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(hours=24)
+        super().save(*args, **kwargs)
+
+    def is_valid(self):
+        """Check if token is valid (not expired and not used)."""
+        return self.is_active and self.used_at is None and timezone.now() < self.expires_at
+
+    def mark_as_used(self):
+        """Mark token as used."""
+        self.used_at = timezone.now()
+        self.is_active = False
+        self.save()

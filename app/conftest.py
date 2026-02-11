@@ -45,6 +45,12 @@ def create_user():
 
 
 @pytest.fixture
+def user(create_user):
+    """Create and return a regular user."""
+    return create_user()
+
+
+@pytest.fixture
 def authenticated_user(create_user):
     """Create and return an authenticated user."""
     return create_user()

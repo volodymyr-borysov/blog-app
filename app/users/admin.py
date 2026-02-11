@@ -3,7 +3,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
-from .models import User
+from .models import PasswordResetToken, User
 
 
 @admin.register(User)
@@ -54,3 +54,31 @@ class UserAdmin(BaseUserAdmin):
             },
         ),
     )
+
+
+@admin.register(PasswordResetToken)
+class PasswordResetTokenAdmin(admin.ModelAdmin):
+    """Admin interface for Password Reset Tokens."""
+
+    list_display = (
+        "user",
+        "token_preview",
+        "created_at",
+        "expires_at",
+        "is_active",
+        "used_at",
+    )
+    list_filter = ("is_active", "created_at", "expires_at")
+    search_fields = ("user__email", "user__username", "token")
+    readonly_fields = ("token", "created_at", "expires_at", "used_at")
+    ordering = ("-created_at",)
+
+    def token_preview(self, obj):
+        """Show first 10 characters of token."""
+        return f"{obj.token[:10]}..." if obj.token else ""
+
+    token_preview.short_description = "Token Preview"
+
+    def has_add_permission(self, request):
+        """Disable manual token creation through admin."""
+        return False
