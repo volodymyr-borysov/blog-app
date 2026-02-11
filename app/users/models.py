@@ -84,7 +84,7 @@ class PasswordResetToken(models.Model):
         help_text="User requesting password reset",
     )
     token = models.CharField(
-        max_length=64,
+        max_length=128,
         unique=True,
         db_index=True,
         help_text="Unique token for password reset",
@@ -102,6 +102,7 @@ class PasswordResetToken(models.Model):
         indexes = [
             models.Index(fields=["token"]),
             models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["expires_at"]),
         ]
 
     def __str__(self):
